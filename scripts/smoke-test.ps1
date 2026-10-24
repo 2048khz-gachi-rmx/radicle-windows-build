@@ -30,6 +30,9 @@ New-Item -ItemType Directory -Force $work | Out-Null
 
 $env:RAD_HOME = Join-Path $work 'radhome'
 $env:RAD_PASSPHRASE = 'smoketest-passphrase'
+# A rad:// remote is served by git-remote-rad.exe, which git finds through
+# PATH. The installer adds this directory to PATH for real users.
+$env:PATH = "$bin;$env:PATH"
 
 $rad = Join-Path $bin 'rad.exe'
 $version = & $rad --version
