@@ -1,0 +1,269 @@
+name: build
+
+# Builds Windows binaries for Radicle from upstream source and publishes them
+# here, because upstream ships no Windows pre-builds.
+#
+#   release     every upstream `releases/X.Y.Z` tag -> its own GitHub release
+#   prerelease  upstream `main`                     -> rolling `continuous` release
+#
+# Nothing is built when neither has moved.
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream ref to build (tag or sha). Empty = normal check.'
+        type: string
+      no_release:
+        description: 'Build but do not publish'
+        type: boolean
+        default: false
+      run_tests:
+        description: 'Run cargo test on x64 before packaging (slow)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RADICLE_SOURCE: https://seed.radicle.xyz/z3gqcJUoA1n9HaHKufZs5FCSGazv5.git
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.decide.outputs.kind }}
+      ref: ${{ steps.decide.outputs.ref }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+      - name: Decide what to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: bash scripts/check.sh
+      - name: Summary
+        run: |
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| kind | ${{ steps.decide.outputs.kind }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ref | ${{ steps.decide.outputs.ref }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| upstream commit | ${{ steps.decide.outputs.sha }} |" >> $GITHUB_STEP_SUMMARY
+
+  build:
+    needs: check
+    if: needs.check.outputs.kind != 'none'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      CARGO_TARGET_DIR: target-static
+      CARGO_INCREMENTAL: '0'
+      ARCH: ${{ matrix.arch }}
+      BUILD_REF: ${{ needs.check.outputs.ref }}
+      SRC_DIR: src
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+
+      # Windows defaults would rewrite line endings and skip symlinks; both
+      # change file content relative to upstream.
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.symlinks false
+          git config --global core.longpaths true
+
+      - name: Clone upstream ${{ needs.check.outputs.ref }}
+        run: |
+          git clone --quiet "$env:RADICLE_SOURCE" src
+          git -C src checkout --detach "$env:BUILD_REF"
+          git -C src log -1 --format='%h %cI %s'
+
+      - name: Prepare source
+        id: source
+        run: ./scripts/prepare-source.ps1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          # Toolchain and components come from rust-toolchain.toml in src/.
+          # RUSTFLAGS comes from the job env; rust-cache keys on it.
+          rust-src-dir: src
+          cache-workspaces: 'src -> target-static'
+          cache-key: ${{ matrix.arch }}-${{ hashFiles('src/Cargo.lock') }}
+          cache-on-failure: true
+
+      - name: Cache NuGet packages (WiX SDK)
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('src/windows/Radicle.wixproj', 'src/windows/Package.wxs') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # --locked: upstream commits Cargo.lock and builds must be reproducible.
+      - name: cargo build
+        working-directory: src
+        run: cargo build --release --locked -p radicle-cli -p radicle-node -p radicle-remote-helper
+
+      - name: cargo test
+        if: inputs.run_tests && matrix.arch == 'x64'
+        working-directory: src
+        env:
+          RUST_TEST_THREADS: 1
+        run: cargo test --release --locked --workspace --all-features -- --nocapture
+
+      - name: Smoke test
+        run: ./scripts/smoke-test.ps1
+
+      - name: Package
+        run: ./scripts/package.ps1
+        env:
+          # prepare-source.ps1 exports RADICLE_VERSION for build.rs and the same
+          # string as this step output, so a tag build and a prerelease build
+          # both name their artifacts from one source.
+          VERSION: ${{ steps.source.outputs.version }}
+
+      - name: Checksums
+        working-directory: src/dist
+        run: |
+          # The arm64 leg ships no MSI, so *.msi may not exist.
+          Get-ChildItem *.zip, *.msi -ErrorAction SilentlyContinue | ForEach-Object {
+            "$((Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content SHA256SUMS-${{ matrix.arch }}.txt
+          Get-Content SHA256SUMS-${{ matrix.arch }}.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: radicle-${{ matrix.arch }}
+          path: |
+            src/dist/*.zip
+            src/dist/*.msi
+            src/dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [check, build]
+    if: needs.check.outputs.kind != 'none' && !inputs.no_release && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: radicle-*
+          merge-multiple: true
+          path: dist
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.msi
+
+      - name: Assemble
+        id: assemble
+        env:
+          KIND: ${{ needs.check.outputs.kind }}
+          SHA: ${{ needs.check.outputs.sha }}
+          REF: ${{ needs.check.outputs.ref }}
+        run: |
+          set -euo pipefail
+          cat dist/SHA256SUMS-*.txt | sort -k2 > dist/SHA256SUMS.txt
+          rm -f dist/SHA256SUMS-x64.txt dist/SHA256SUMS-arm64.txt
+          ls -l dist
+
+          # Version comes from the asset names, so the matrix legs do not have
+          # to agree on a job output.
+          version=$(basename "$(ls dist/*-x86_64-pc-windows-msvc.zip | head -n1)" |
+            sed -e 's/^radicle-//' -e 's/-x86_64-pc-windows-msvc\.zip$//')
+          echo "version: $version"
+
+          # A tag has no commit suffix: 1.10.3, while a rolling build looks like
+          # 1.10.3-50-g2a758c94. Only the former names a release.
+          if [[ "$KIND" == release && ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$ ]]; then
+            echo "release build produced an unexpected version: $version" >&2
+            exit 1
+          fi
+
+          if [[ "$KIND" == release ]]; then
+            tag="$version"
+            title="Radicle $version for Windows"
+            args=()
+            # Upstream release candidates are published to us as prereleases.
+            if [[ "$version" == *-* ]]; then args+=(--prerelease); fi
+          else
+            tag=continuous
+            title="Radicle continuous for Windows"
+            args=(--prerelease)
+          fi
+
+          {
+            echo "Windows builds of Radicle, produced from upstream source on GitHub Actions."
+            echo
+            echo "Upstream-Commit: $SHA"
+            echo "Upstream-Ref: $REF"
+            echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo '| Asset | Contents |'
+            echo '|---|---|'
+            echo '| `*-x86_64-pc-windows-msvc.zip` | `rad.exe`, `radicle-node.exe`, `git-remote-rad.exe`, licenses |'
+            echo '| `*-aarch64-pc-windows-msvc.zip` | same, for Windows on ARM |'
+            echo '| `*.msi` | per-user installer, adds `%LOCALAPPDATA%\Radicle\bin` to `PATH` |'
+            echo
+            echo "Binaries use the static CRT: no Visual C++ Redistributable needed."
+            echo "They are **unsigned**, so SmartScreen will warn."
+          } > notes.md
+
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "title=$title" >> $GITHUB_OUTPUT
+          printf 'args=%s\n' "${args[*]}" >> $GITHUB_OUTPUT
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.assemble.outputs.tag }}
+          TITLE: ${{ steps.assemble.outputs.title }}
+          KIND: ${{ needs.check.outputs.kind }}
+          ARGS: ${{ steps.assemble.outputs.args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          set -- $ARGS
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [[ "$KIND" == prerelease ]]; then
+              # Rolling release: drop the previous day's assets so names do
+              # not accumulate.
+              gh release view "$TAG" --json assets -q '.assets[].name' |
+                while read -r name; do gh release delete-asset "$TAG" "$name" -y; done
+            fi
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md "$@"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TITLE" --notes-file notes.md "$@"
+          fi
+          gh release view "$TAG" --json url -q .url >> $GITHUB_STEP_SUMMARY
+
