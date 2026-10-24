@@ -7,6 +7,9 @@
 $ErrorActionPreference = 'Stop'
 
 $src = if ($env:SRC_DIR) { $env:SRC_DIR } else { 'src' }
+# Absolute: the script changes directory later (rad init runs inside a scratch
+# repository), and relative paths would stop resolving.
+$src = (Resolve-Path $src).Path
 $arch = if ($env:ARCH) { $env:ARCH } else { 'x64' }
 $bin = Join-Path $src 'target-static\release'
 

@@ -10,6 +10,8 @@
 $ErrorActionPreference = 'Stop'
 
 $src = if ($env:SRC_DIR) { $env:SRC_DIR } else { 'src' }
+# Absolute: the MSI step changes into windows/ and back.
+$src = (Resolve-Path $src).Path
 $version = $env:VERSION
 $arch = if ($env:ARCH) { $env:ARCH } else { 'x64' }
 if (-not $version) { throw 'VERSION is required' }
