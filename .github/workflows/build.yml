@@ -11,6 +11,11 @@ name: build
 on:
   schedule:
     - cron: '23 4 * * *'
+  # Runs the cheap check on changes here, so a broken workflow is noticed
+  # before the next schedule. Successive commits in this repository usually
+  # end in the check job finding nothing new.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       ref:
