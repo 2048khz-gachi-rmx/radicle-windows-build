@@ -168,7 +168,12 @@ jobs:
 
   publish:
     needs: [check, build]
-    if: needs.check.outputs.kind != 'none' && !inputs.no_release && !cancelled()
+    # Both matrix legs must have succeeded: an `if` that mentions cancelled()
+    # drops the implicit success requirement, so success() is stated again.
+    if: >-
+      !cancelled() && !inputs.no_release &&
+      needs.check.outputs.kind != 'none' &&
+      needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
