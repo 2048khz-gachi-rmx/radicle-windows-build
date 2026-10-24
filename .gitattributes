@@ -1,0 +1,4 @@
+# Bash scripts run on Linux runners; a CRLF checkout would break the shebang.
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.ps1  text eol=crlf
